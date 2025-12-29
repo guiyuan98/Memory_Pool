@@ -18,14 +18,23 @@
 
 // 内存块头部信息结构（用于追踪和管理）
 struct Memory_Block_Header {
-    size_t size;       // 实际分配的大小
-    size_t block_size; // 内存池块大小级别
-    bool in_use;       // 是否正在使用
-    void *pool_ptr;    // 指向所属的内存池（用于释放）
+    size_t size;                                            // 实际分配的大小
+    size_t block_size;                                      // 内存池块大小级别
+    bool in_use;                                            // 是否正在使用
+    void *pool_ptr;                                         // 指向所属的内存池（用于释放）
+    std::chrono::steady_clock::time_point last_return_time; // 最后一次归还时间
 };
 
 // 单级内存池（管理特定大小的内存块）
 class Fixed_Size_Pool {
+  private:
+    size_t block_size_;                       // 块大小
+    size_t alignment_;                        // 对齐大小
+    std::list<void *> free_blocks_;           // 空闲块链表
+    std::mutex mutex_;                        // 保护该池的互斥锁
+    std::atomic<size_t> current_used_ = 0;    // 当前使用中的块数
+    std::atomic<size_t> current_free_ = 0;    // 当前空闲的块数
+    std::atomic<size_t> total_allocated_ = 0; // 总分配块数
   public:
     Fixed_Size_Pool(size_t block_size, size_t alignment = 8)
         : block_size_(block_size), alignment_(alignment), mutex_() {
@@ -90,6 +99,7 @@ class Fixed_Size_Pool {
 
         std::lock_guard<std::mutex> lock(mutex_);
         header->in_use = false;
+        header->last_return_time = std::chrono::steady_clock::now();
         free_blocks_.push_back(ptr);
         current_used_--;
         current_free_++;
@@ -100,14 +110,74 @@ class Fixed_Size_Pool {
     size_t get_current_free() const { return current_free_; }
     size_t get_total_allocated() const { return total_allocated_; }
 
-  private:
-    size_t block_size_;             // 块大小
-    size_t alignment_;              // 对齐大小
-    std::list<void *> free_blocks_; // 空闲块链表
-    std::mutex mutex_;              // 保护该池的互斥锁
-    size_t current_used_ = 0;       // 当前使用中的块数
-    size_t current_free_ = 0;       // 当前空闲的块数
-    size_t total_allocated_ = 0;    // 总分配块数
+    // 获取空闲块数量（用于统计）
+    size_t get_free_block_count() const { return current_free_.load(); }
+
+    // 清理过多的空闲块（释放部分空闲块回操作系统）
+    // max_free_blocks: 保留的最大空闲块数，超过的部分会被释放
+    size_t cleanup_excess_blocks(size_t max_free_blocks) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t released_count = 0;
+
+        // 如果空闲块数量超过限制，释放多余的部分
+        while (free_blocks_.size() > max_free_blocks && !free_blocks_.empty()) {
+            void *ptr = free_blocks_.front();
+            free_blocks_.pop_front();
+
+            // 从用户指针计算原始内存地址（需要找到头部）
+            size_t header_size =
+                (sizeof(Memory_Block_Header) + alignment_ - 1) & ~(alignment_ - 1);
+            void *raw_ptr = static_cast<char *>(ptr) - header_size;
+
+            // 释放内存回操作系统
+            std::free(raw_ptr);
+            current_free_--;
+            total_allocated_--;
+            released_count++;
+        }
+        return released_count;
+    }
+
+    // 清理超时的空闲块（基于最后归还时间）
+    // idle_timeout: 空闲超时时间，超过这个时间的空闲块会被释放
+    size_t cleanup_idle_blocks_by_time(std::chrono::seconds idle_timeout) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        size_t released_count = 0;
+        auto now = std::chrono::steady_clock::now();
+
+        // 遍历空闲块链表，找出超时的块
+        std::list<void *> valid_blocks;
+        size_t header_size =
+            (sizeof(Memory_Block_Header) + alignment_ - 1) & ~(alignment_ - 1);
+
+        while (!free_blocks_.empty()) {
+            void *ptr = free_blocks_.front();
+            free_blocks_.pop_front();
+
+            // 从用户指针计算头部地址
+            Memory_Block_Header *header =
+                reinterpret_cast<Memory_Block_Header *>(static_cast<char *>(ptr) - header_size);
+
+            // 检查是否超时
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                now - header->last_return_time);
+            if (elapsed >= idle_timeout) {
+                // 超时了，释放这个块
+                void *raw_ptr = static_cast<char *>(ptr) - header_size;
+                std::free(raw_ptr);
+                current_free_--;
+                total_allocated_--;
+                released_count++;
+            } else {
+                // 未超时，保留这个块
+                valid_blocks.push_back(ptr);
+            }
+        }
+
+        // 将有效的块放回空闲链表
+        free_blocks_ = std::move(valid_blocks);
+        return released_count;
+    }
 };
 
 // 线程局部缓存（每个线程维护自己的小块内存缓存）
@@ -167,8 +237,8 @@ class Memory_Pool {
         if (!config_.enable_tls) {
             return nullptr;
         }
-        static thread_local Thread_Local_Cache *tls_cache = nullptr;
-        static thread_local bool tls_initialized = false;
+        static thread_local Thread_Local_Cache *tls_cache = nullptr; // 线程局部缓存
+        static thread_local bool tls_initialized = false;            // 线程局部缓存是否初始化
 
         if (!tls_initialized) {
             tls_cache = new Thread_Local_Cache();
@@ -210,11 +280,49 @@ class Memory_Pool {
     }
 
     // 清理空闲内存块
+    // 注意：固定大小池设计已经避免了碎片问题（相同大小的块可以完美复用）
+    // 每30秒执行一次，清理：
+    // 1. 基于空闲时间的清理：释放超过 idle_timeout 的空闲块
+    // 2. 基于数量的清理：限制每个池的空闲块数量
     void cleanup_idle_blocks() {
-        // 对于固定大小池，主要清理碎片
-        // 这里可以扩展为更复杂的碎片整理算法
+        size_t total_released = 0;
+
+        // 1. 基于时间的清理：清理超过空闲超时时间的块
+        for (auto &pool : pools_) {
+            size_t released = pool->cleanup_idle_blocks_by_time(config_.idle_timeout);
+            total_released += released;
+        }
+
+        // 2. 基于数量的清理：每个池最多保留的空闲块数量
+        const size_t MAX_FREE_BLOCKS_PER_POOL = 100;
+        for (auto &pool : pools_) {
+            size_t free_count = pool->get_free_block_count();
+            if (free_count > MAX_FREE_BLOCKS_PER_POOL) {
+                size_t released = pool->cleanup_excess_blocks(MAX_FREE_BLOCKS_PER_POOL);
+                total_released += released;
+            }
+        }
+
+        // 3. 检查总内存使用是否超过限制
+        size_t current_total = stats_.total_allocated.load();
+        if (current_total > config_.max_total_memory) {
+            // 如果超过限制，更激进的清理：每个池只保留 10 个空闲块
+            for (auto &pool : pools_) {
+                size_t released = pool->cleanup_excess_blocks(10);
+                total_released += released;
+            }
+        }
+
+        // 更新当前空闲内存统计
+        size_t current_free = 0;
+        for (const auto &pool : pools_) {
+            size_t free_count = pool->get_free_block_count();
+            current_free += free_count * pool->get_block_size();
+        }
+        stats_.current_free.store(current_free);
+
+        // 固定大小池没有碎片问题，碎片计数设为0
         stats_.fragment_count.store(0);
-        // TODO: 实现碎片检测和整理逻辑
     }
 
     // 清理线程函数
@@ -350,40 +458,6 @@ class Memory_Pool {
         std::free(header);
         stats_.total_freed += size;
         stats_.current_used -= size;
-    }
-
-    // 重新分配内存（可选功能）
-    void *reallocate(void *ptr, size_t new_size) {
-        if (!ptr) {
-            return allocate(new_size);
-        }
-
-        // 获取旧内存大小
-        size_t header_size =
-            (sizeof(Memory_Block_Header) + config_.alignment - 1) & ~(config_.alignment - 1);
-        Memory_Block_Header *header =
-            reinterpret_cast<Memory_Block_Header *>(static_cast<char *>(ptr) - header_size);
-        size_t old_size = header->size;
-
-        // 如果新旧大小相同或相近，直接返回原指针
-        if (new_size <= old_size && new_size > old_size / 2) {
-            return ptr;
-        }
-
-        // 分配新内存
-        void *new_ptr = allocate(new_size);
-        if (!new_ptr) {
-            return nullptr;
-        }
-
-        // 拷贝数据
-        size_t copy_size = (old_size < new_size) ? old_size : new_size;
-        std::memcpy(new_ptr, ptr, copy_size);
-
-        // 释放旧内存
-        deallocate(ptr);
-
-        return new_ptr;
     }
 
     // 获取统计信息
